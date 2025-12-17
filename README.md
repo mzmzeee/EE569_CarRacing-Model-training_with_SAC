@@ -1,70 +1,132 @@
-# CarRacing-v3: SAC Implementation
+# EE569 CarRacing-v3: SAC Implementation for Autonomous Racing
 
-## Overview
-This repository contains an implementation of **Soft Actor-Critic (SAC)** for the CarRacing-v3 environment. The agent learns to drive from raw pixel inputs (84×84 grayscale images) using deep reinforcement learning.
+## 📋 Project Overview
+This repository contains a complete implementation of **Soft Actor-Critic (SAC)** for the **CarRacing-v3** environment from Gymnasium.  
+The agent learns autonomous driving directly from **raw pixel inputs (84×84 grayscale frames)** using deep reinforcement learning.
 
-## Features
-- **Algorithm:** Soft Actor-Critic (SAC)
-- **Input:** 84×84 grayscale pixels (4-frame stack)
-- **Output:** Continuous actions (steering, acceleration, brake)
-- **Evaluation:** 3 episodes as per assignment requirements
-- **Performance:** >700 average reward achieved
+- **Course:** EE569 Deep Learning  
+- **Assignment:** CarRacing-v3 RL Challenge  
+- **Algorithm:** Soft Actor-Critic (SAC)  
+- **Status:** ✅ Requirements met (>700 average reward)
 
-## Installation
+---
+
+## 🏎️ Performance
+- **Best Evaluation Score:** *[Insert your score here]* (average over 3 episodes)  
+- **Target Requirement:** >700 (Achieved)  
+- **Training Episodes:** 4000  
+- **Total Environment Steps:** *[Insert steps here]*  
+
+---
+
+## 🚀 Quick Start
+
+### Installation
 ```bash
+# Clone repository
+git clone https://github.com/[your-username]/EE569_CarRacing-Model-training_with_SAC.git
+cd EE569_CarRacing-Model-training_with_SAC
+
+# Install dependencies
 pip install -r requirements.txt
-Usage
-Training
-bash
+```
+
+### Training
+```bash
 python train.py
-Evaluation & Video Recording
-bash
+```
+
+### Evaluation
+```bash
+# Evaluate best model (3 episodes)
+python inference.py --checkpoint checkpoints/best_actor.pth --episodes 3
+
+# Record evaluation video (best_run.mp4)
 python inference.py --checkpoint checkpoints/best_actor.pth --episodes 3 --save-video
-Project Structure
-text
-├── train.py                 # Training script
-├── inference.py             # Evaluation script
-├── requirements.txt         # Dependencies
-├── checkpoints/            # Saved models
-│   ├── best_model.pth
-│   └── best_actor.pth
-├── videos/                 # Recorded runs
-│   └── best_run.mp4
-├── logs/                   # TensorBoard logs
-└── README.md
-Model Architecture
-CNN Encoder: 3 convolutional layers (96→192→256)
+```
 
-Actor Network: Gaussian policy with automatic entropy tuning
+---
 
-Critic Networks: Twin Q-networks (TD3-style)
+## 📁 Project Structure
+```
+EE569_CarRacing-Model-training_with_SAC/
+├── train.py               # Main training script
+├── inference.py           # Evaluation and video recording
+├── requirements.txt       # Dependency specifications
+├── checkpoints/           # Saved model weights
+├── videos/                # Recorded videos
+├── logs/                  # TensorBoard logs
+├── training_results.json  # Training metrics
+└── README.md              # This file
+```
 
-Hidden Layers: 1536 units with residual connections
+---
 
-Hyperparameters
-Parameter	Value
-Learning Rate	8e-5
-Batch Size	768
-Discount Factor (γ)	0.99
-Target Update (τ)	0.005
-Replay Buffer Size	3M
-Initial Exploration Steps	5000
-Results
-✅ Assignment Requirement Met: >700 average reward over 3 episodes
+## 🧠 Model Architecture
 
-📈 Training Logs: Available via TensorBoard
+### Network Design
+- **Input:** 4 × 84 × 84 grayscale stacked frames  
+- **CNN Encoder:** 96 → 192 → 256 channels with BatchNorm  
+- **Actor Network:** Gaussian policy with automatic entropy tuning  
+- **Critic Networks:** Twin Q-networks for stable learning  
+- **Hidden Size:** 1536 fully-connected units  
 
-🎥 Best Run Video: videos/best_run.mp4
+---
 
-Requirements Checklist
-Pixel input (84×84)
+## ⚙️ Hyperparameters
 
-Average reward > 700
+| Parameter        | Value | Description                     |
+|------------------|-------|---------------------------------|
+| Learning Rate     | 8e-5  | AdamW optimizer                 |
+| Batch Size        | 768   | Training batch size             |
+| Discount (γ)      | 0.99  | Future reward discount          |
+| Target Update (τ) | 0.005 | Soft target update              |
+| Memory Size       | 3M    | Replay buffer capacity          |
 
-3-episode evaluation
+---
 
-Video recording capability
+## 📊 Results & Visualization
 
-TensorBoard logging
+### Training Metrics (TensorBoard)
+```bash
+tensorboard --logdir=logs
+```
 
-Clean, modular code
+---
+
+## 📝 Assignment Requirements Checklist
+
+| Requirement               | Status | Notes                        |
+|---------------------------|--------|------------------------------|
+| Pixel input (84×84)       | ✅     | Grayscale with stacking      |
+| >700 average reward       | ✅     | Achieved                     |
+| 3-episode evaluation      | ✅     | Proper evaluation protocol   |
+| Video recording           | ✅     | best_run.mp4 generated       |
+| TensorBoard logging       | ✅     | Comprehensive metrics        |
+| Clean, modular code       | ✅     | Well-structured implementation |
+
+---
+
+## 🔬 Technical Highlights
+
+### Advanced Features
+- **Prioritized Experience Replay** – Efficient sample utilization  
+- **Automatic Entropy Tuning** – Adaptive exploration–exploitation  
+- **Cosine Annealing LR** – Smooth learning rate decay  
+- **Frame Stacking** – Temporal information preservation  
+- **Image Enhancement (CLAHE)** – Improved feature extraction  
+
+---
+
+## 📚 References
+- Haarnoja et al. (2018). *Soft Actor-Critic: Off-Policy Maximum Entropy Deep Reinforcement Learning with a Stochastic Actor*  
+- Brockman et al. (2016). *OpenAI Gym*  
+- EE569 Deep Learning Course Materials  
+
+---
+
+## 👥 Authors
+- **[Mahfoud Abdulmolla / Mu'taz Al-Harbi ]**  
+- EE569 Deep Learning Course  
+- **[University of Tripoli]**  
+- **[29/12/2025]**

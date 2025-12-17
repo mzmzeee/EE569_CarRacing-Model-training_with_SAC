@@ -1,4 +1,9 @@
 gymnasium[box2d]
-torch>=2.0.0
+torch
 numpy
 opencv-python
+tensorboard
+pygame
+imageio
+matplotlib
+tqdm

@@ -1,9 +1,14 @@
-gymnasium[box2d]
-torch
-numpy
-opencv-python
-tensorboard
-pygame
-imageio
-matplotlib
-tqdm
+# Core requirements for CarRacing-v3 with SAC
+gymnasium[box2d]==0.29.1
+torch==2.1.0
+torchvision==0.16.0
+numpy==1.24.3
+opencv-python==4.8.1.78
+tensorboard==2.15.1
+pygame==2.5.2
+imageio==2.31.6
+imageio-ffmpeg==0.4.9
+matplotlib==3.8.2
+tqdm==4.66.1
+pandas==2.1.4
+scipy==1.11.4

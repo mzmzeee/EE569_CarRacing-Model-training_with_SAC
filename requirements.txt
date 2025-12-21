@@ -13,3 +13,4 @@ matplotlib
 tqdm
 pandas
 scipy
+kornia>=0.7.0

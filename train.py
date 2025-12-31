@@ -26,7 +26,7 @@ warnings.filterwarnings("ignore")
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True" # Help with fragmentation
 NUM_EPISODES = 5000                    # Longer training
 MAX_STEPS_PER_EPISODE = 1500           # Full lap completion
-BATCH_SIZE = 340                       # Safe default for 6GB VRAM
+BATCH_SIZE = 400                       # Safe default for 6GB VRAM
 GAMMA = 0.99
 TAU = 0.01                             # Soft target updates
 ALPHA_INIT = 0.2
@@ -35,7 +35,7 @@ MEMORY_SIZE = 300000                   # 300k steps ~ 8.5GB RAM (Optimized)
 HIDDEN_SIZE = 256                      # Reduced to 256 to save VRAM and compute
 INITIAL_EXPLORATION_STEPS = 20000      # Exploration before policy training
 EXPLORATION_NOISE = 0.15               # Action noise for exploration
-ACTION_REPEAT = 2                      # Frame skipping (2 for fine steering control)
+ACTION_REPEAT = 4                      # Frame skipping (4 for faster training)
 
 
 # Path for checkpoints and logs
@@ -84,11 +84,11 @@ class ActorNetwork(nn.Module):
         self.res2 = ResidualBlock(64, 128, stride=2)  # 42 -> 21
         self.res3 = ResidualBlock(128, 256, stride=2) # 21 -> 11
         
-        # Adaptive pooling to 6x6 for consistent feature size
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((6, 6))
+        # Adaptive pooling to 2x2 for consistent feature size (Reduced from 6x6)
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((2, 2))
         
-        # Dense features: (64 + 128 + 256) * 36 = 16,128
-        dense_size = (64 + 128 + 256) * 36
+        # Dense features: (64 + 128 + 256) * 4 = 1,792
+        dense_size = (64 + 128 + 256) * 4
         
         # MLP with D2RL skip connection
         self.fc1 = nn.Linear(dense_size, hidden_dim)
@@ -105,12 +105,12 @@ class ActorNetwork(nn.Module):
         f3 = self.res3(f2)      # 256 x 11 x 11
         
         # Pool all features to same size for dense concatenation
-        p1 = self.adaptive_pool(f1).flatten(1)  # 64 * 36 = 2304
-        p2 = self.adaptive_pool(f2).flatten(1)  # 128 * 36 = 4608
-        p3 = self.adaptive_pool(f3).flatten(1)  # 256 * 36 = 9216
+        p1 = self.adaptive_pool(f1).flatten(1)  # 64 * 4 = 256
+        p2 = self.adaptive_pool(f2).flatten(1)  # 128 * 4 = 512
+        p3 = self.adaptive_pool(f3).flatten(1)  # 256 * 4 = 1024
         
         # D2RL dense concatenation
-        features = torch.cat([p1, p2, p3], dim=1)  # 16128
+        features = torch.cat([p1, p2, p3], dim=1)  # 1792
         
         # MLP with skip connection
         x = F.relu(self.fc1(features))
@@ -143,10 +143,10 @@ class CriticNetwork(nn.Module):
         self.res1 = ResidualBlock(4, 64, stride=2)
         self.res2 = ResidualBlock(64, 128, stride=2)
         self.res3 = ResidualBlock(128, 256, stride=2)
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((6, 6))
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((2, 2))
         
-        # Dense features: (64 + 128 + 256) * 36 = 16,128
-        dense_size = (64 + 128 + 256) * 36
+        # Dense features: (64 + 128 + 256) * 4 = 1,792
+        dense_size = (64 + 128 + 256) * 4
         
         # Q1 architecture with D2RL skip
         self.linear1_q1 = nn.Linear(dense_size + action_dim, hidden_dim)
@@ -280,17 +280,19 @@ class SACAgent:
         state_batch, action_batch, reward_batch, next_state_batch, done_batch = memory.sample(batch_size)
 
         # Convert to float and normalize here (Max RAM savings!)
-        # Non_blocking=True for faster CPU->GPU transfer
-        state_batch = torch.FloatTensor(state_batch).to(self.device, non_blocking=True).div(255.0)
-        next_state_batch = torch.FloatTensor(next_state_batch).to(self.device, non_blocking=True).div(255.0)
+        # Use torch.tensor or .to() for non_blocking support, as_tensor does not support it directly
+        state_batch = torch.as_tensor(state_batch, device=self.device).float().div_(255.0)
+        next_state_batch = torch.as_tensor(next_state_batch, device=self.device).float().div_(255.0)
         
-        action_batch = torch.FloatTensor(action_batch).to(self.device, non_blocking=True)
-        reward_batch = torch.FloatTensor(reward_batch).to(self.device, non_blocking=True)
-        done_batch = torch.FloatTensor(done_batch).to(self.device, non_blocking=True)
+        action_batch = torch.as_tensor(action_batch, device=self.device)
+        reward_batch = torch.as_tensor(reward_batch, device=self.device)
+        done_batch = torch.as_tensor(done_batch, device=self.device)
         
         # Apply data augmentation (random crop)
-        state_batch = self.aug(state_batch)
-        next_state_batch = self.aug(next_state_batch)
+        # Optimization: Batch the augmentation to reduce kernel launches
+        combined_states = torch.cat([state_batch, next_state_batch], dim=0)
+        combined_states_aug = self.aug(combined_states)
+        state_batch, next_state_batch = torch.split(combined_states_aug, batch_size, dim=0)
         
         self.total_steps += 1
 
@@ -518,7 +520,8 @@ def main():
     print(f"🌱 Setting random seed to {SEED}")
     set_seed(SEED)
 
-    env = gym.make("CarRacing-v3", continuous=True, render_mode="rgb_array")
+    # Optimization: Disable render_mode for training env to save CPU cycles
+    env = gym.make("CarRacing-v3", continuous=True, render_mode=None)
     
     action_limit = env.action_space.high[0]
     state_dim = (4, 84, 84)
@@ -606,13 +609,15 @@ def main():
                 state = next_state
                 episode_reward += total_reward
 
-                # Updated frequency: Every 2 environment steps + double gradient updates
                 # Updated frequency: Every N environment steps
                 if len(memory) > batch_size and step % update_freq == 0:
-                    for _ in range(update_freq):  # Balanced updates
+                    # Reduce update ratio to 0.5 updates per step to save GPU
+                    update_info = None
+                    for _ in range(max(1, update_freq // 2)): 
                         update_info, _ = agent.update_parameters(memory, batch_size)
                     
                     # Log only once per batch of updates to reduce CPU-GPU sync overhead
+                    # Optimization: Moved logging OUTSIDE the loop
                     if update_info:
                         writer.add_scalar('Loss/critic', update_info['critic_loss'].item(), agent.total_steps)
                         writer.add_scalar('Loss/actor', update_info['actor_loss'].item(), agent.total_steps)
@@ -653,8 +658,12 @@ def main():
                 reserved = torch.cuda.memory_reserved() / 1e9
                 print(f"   📊 VRAM: {allocated:.2f}GB / {reserved:.2f}GB | RAM Buffer: ~{len(memory) * 28 / 1e6:.1f}MB")
 
-            # Save latest checkpoint after each episode
-            agent.save_checkpoint(LATEST_CHECKPOINT, episode, best_eval_reward, memory)
+            # Save latest checkpoint after each episode (Buffer saved periodically)
+            agent.save_checkpoint(LATEST_CHECKPOINT, episode, best_eval_reward, memory=None)
+            
+            # Save buffer periodically (every 10 episodes)
+            if episode % 10 == 0:
+                memory.save(os.path.join(CHECKPOINT_DIR, "latest_buffer.npz"))
 
             # Evaluation and Best Checkpoint Saving (every 10 episodes)
             if episode % 10 == 0:

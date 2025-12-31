@@ -54,11 +54,11 @@ class ActorNetwork(nn.Module):
         self.res2 = ResidualBlock(64, 128, stride=2)  # 42 -> 21
         self.res3 = ResidualBlock(128, 256, stride=2) # 21 -> 11
         
-        # Adaptive pooling to 6x6 for consistent feature size
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((6, 6))
+        # Adaptive pooling to 2x2 for consistent feature size
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((2, 2))
         
-        # Dense features: (64 + 128 + 256) * 36 = 16,128
-        dense_size = (64 + 128 + 256) * 36
+        # Dense features: (64 + 128 + 256) * 4 = 1,792
+        dense_size = (64 + 128 + 256) * 4
         
         # MLP with D2RL skip connection
         self.fc1 = nn.Linear(dense_size, hidden_dim)
@@ -75,12 +75,12 @@ class ActorNetwork(nn.Module):
         f3 = self.res3(f2)      # 256 x 11 x 11
         
         # Pool all features to same size for dense concatenation
-        p1 = self.adaptive_pool(f1).flatten(1)  # 64 * 36 = 2304
-        p2 = self.adaptive_pool(f2).flatten(1)  # 128 * 36 = 4608
-        p3 = self.adaptive_pool(f3).flatten(1)  # 256 * 36 = 9216
+        p1 = self.adaptive_pool(f1).flatten(1)  # 64 * 4 = 256
+        p2 = self.adaptive_pool(f2).flatten(1)  # 128 * 4 = 512
+        p3 = self.adaptive_pool(f3).flatten(1)  # 256 * 4 = 1024
         
         # D2RL dense concatenation
-        features = torch.cat([p1, p2, p3], dim=1)  # 16128
+        features = torch.cat([p1, p2, p3], dim=1)  # 1792
         
         # MLP with skip connection
         x = F.relu(self.fc1(features))
@@ -151,7 +151,7 @@ class StackFrames(gym.Wrapper):
         return np.stack(self.frames, axis=0), reward, terminated, truncated, info
 
 
-def make_env(render_mode=None, skip_frames=2):
+def make_env(render_mode=None, skip_frames=4):
     env = gym.make("CarRacing-v3", continuous=True, render_mode=render_mode)
     env = FrameSkip(env, skip=skip_frames)
     env = StackFrames(env, stack_size=4)
@@ -195,7 +195,7 @@ def load_model(checkpoint_path, state_dim, action_dim, hidden_dim, action_limit,
         print(f"⚠️  Error loading: {e}")
         print("Trying to load with strict=False...")
         try:
-            model.load_state_dict(torch.load(checkpoint_path, map_location=device), strict=False)
+            model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=False), strict=False)
             print(f"✅ Loaded with strict=False (some layers may be missing)")
         except Exception as e2:
             print(f"❌ Failed to load: {e2}")

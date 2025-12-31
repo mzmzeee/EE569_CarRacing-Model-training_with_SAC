@@ -243,8 +243,8 @@ def main():
                         help='Directory to save videos')
     parser.add_argument('--device', type=str, default='auto',
                         choices=['auto', 'cpu', 'cuda'], help='Device to use')
-    parser.add_argument('--hidden-size', type=int, default=512,
-                        help='Hidden size of the actor (must match training, default: 512)')
+    parser.add_argument('--hidden-size', type=int, default=256,
+                        help='Hidden size of the actor (must match training, default: 256)')
     
     args = parser.parse_args()
 

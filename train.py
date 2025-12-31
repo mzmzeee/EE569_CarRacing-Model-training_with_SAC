@@ -7,6 +7,7 @@ import numpy as np
 import random
 import os
 import cv2
+import time
 from collections import deque
 from torch.utils.tensorboard import SummaryWriter
 from torch.amp import autocast, GradScaler
@@ -15,6 +16,9 @@ import sys
 import warnings
 import argparse
 
+# Import optimized buffer
+from buffer import ReplayBuffer
+
 # Suppress warnings (e.g. from pygame/pkg_resources)
 warnings.filterwarnings("ignore")
 
@@ -22,12 +26,12 @@ warnings.filterwarnings("ignore")
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True" # Help with fragmentation
 NUM_EPISODES = 3000                    # Longer training
 MAX_STEPS_PER_EPISODE = 1500           # Full lap completion
-BATCH_SIZE = 300                       # Reduced to 128 to prevent CUDA OOM on 6GB VRAM
+BATCH_SIZE = 340                       # Safe default for 6GB VRAM
 GAMMA = 0.99
 TAU = 0.01                             # Soft target updates
 ALPHA_INIT = 0.2
 LEARNING_RATE = 3e-4                   # Standard SAC learning rate
-MEMORY_SIZE = 300000                   # Reduced to ~150k (approx 8.5GB) to fit in 16GB RAM
+MEMORY_SIZE = 300000                   # 300k steps ~ 8.5GB RAM (Optimized)
 HIDDEN_SIZE = 256                      # Reduced to 256 to save VRAM and compute
 INITIAL_EXPLORATION_STEPS = 20000      # Exploration before policy training
 EXPLORATION_NOISE = 0.15               # Action noise for exploration
@@ -180,19 +184,7 @@ class CriticNetwork(nn.Module):
         return x1, x2
 
 
-class ReplayMemory:
-    def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
-
-    def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
-
-    def sample(self, batch_size):
-        state, action, reward, next_state, done = zip(*random.sample(self.buffer, batch_size))
-        return np.stack(state), np.stack(action), np.stack(reward), np.stack(next_state), np.stack(done)
-
-    def __len__(self):
-        return len(self.buffer)
+# ReplayMemory removed in favor of buffer.py ReplayBuffer
 
 
 class SACAgent:
@@ -206,10 +198,17 @@ class SACAgent:
         self.target_critic = CriticNetwork(state_dim, action_dim, hidden_dim).to(device)
         self.target_critic.load_state_dict(self.critic.state_dict())
 
+        # OPTIMIZATION: Compile models if available (PyTorch 2.0+)
+        if hasattr(torch, 'compile'):
+            print("🚀 Compiling models with torch.compile()...")
+            self.actor = torch.compile(self.actor)
+            self.critic = torch.compile(self.critic)
+            # Target critic usually doesn't need compilation as it's not backpropped, but can be
+        
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=LEARNING_RATE)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=LEARNING_RATE)
 
-        self.target_entropy = -torch.prod(torch.Tensor(action_dim).to(device)).item()
+        self.target_entropy = -float(action_dim)  # SAC standard: -dim(A)
         self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=LEARNING_RATE)
         
@@ -228,13 +227,48 @@ class SACAgent:
     def alpha(self):
         return self.log_alpha.exp()
 
+    def _safe_load_state(self, model, state_dict):
+        """Safely load state dict, handling compiled models and prefix issues."""
+        # ADDED DEBUG FOR USER ANALYSIS
+        print(f"DEBUG: _safe_load_state called for {type(model)}")
+        
+        # 1. Sanitize state_dict keys (remove _orig_mod prefix if present)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith('_orig_mod.'):
+                # print(f"DEBUG: Cleaning key {k} -> {k[10:]}")
+                new_state_dict[k[10:]] = v
+            else:
+                new_state_dict[k] = v
+                
+        # Debug check to catch if keys still have prefixes
+        keys = list(new_state_dict.keys())
+        if keys:
+            # print(f"DEBUG: Sample key in new_state_dict: {keys[0]}")
+            if keys[0].startswith('_orig_mod'):
+                 print("CRITICAL ERROR: Key still has prefix!")
+        
+        # 2. Load into the original uncompiled model to avoid key mismatches
+        if hasattr(model, '_orig_mod'):
+            print("DEBUG: Loading into _orig_mod (Compiled Model)")
+            model._orig_mod.load_state_dict(new_state_dict)
+        else:
+            print("DEBUG: Loading directly into model (Uncompiled)")
+            model.load_state_dict(new_state_dict)
+
+    def _safe_get_state(self, model):
+        """Safely get state dict, handling compiled models."""
+        if hasattr(model, '_orig_mod'):
+            return model._orig_mod.state_dict()
+        return model.state_dict()
+
     def select_action(self, state, evaluate=False):
         # State is uint8 (0-255) from buffer or env, normalize on fly
         state = torch.FloatTensor(state).unsqueeze(0).to(self.device).div(255.0)
         
         if evaluate:
             mean, _ = self.actor(state)
-            return mean.cpu().data.numpy().flatten()
+            return (torch.tanh(mean) * self.action_limit).cpu().data.numpy().flatten()
         else:
             # No grad needed for sampling action
             with torch.no_grad():
@@ -242,16 +276,17 @@ class SACAgent:
             return action.cpu().data.numpy().flatten()
 
     def update_parameters(self, memory, batch_size):
-        # Sample a batch from memory (uint8 states)
+        # Sample a batch from memory (optimized numpy buffer)
         state_batch, action_batch, reward_batch, next_state_batch, done_batch = memory.sample(batch_size)
 
         # Convert to float and normalize here (Max RAM savings!)
-        state_batch = torch.FloatTensor(state_batch).to(self.device).div(255.0)
-        next_state_batch = torch.FloatTensor(next_state_batch).to(self.device).div(255.0)
+        # Non_blocking=True for faster CPU->GPU transfer
+        state_batch = torch.FloatTensor(state_batch).to(self.device, non_blocking=True).div(255.0)
+        next_state_batch = torch.FloatTensor(next_state_batch).to(self.device, non_blocking=True).div(255.0)
         
-        action_batch = torch.FloatTensor(action_batch).to(self.device)
-        reward_batch = torch.FloatTensor(reward_batch).to(self.device).unsqueeze(1)
-        done_batch = torch.FloatTensor(done_batch).to(self.device).unsqueeze(1)
+        action_batch = torch.FloatTensor(action_batch).to(self.device, non_blocking=True)
+        reward_batch = torch.FloatTensor(reward_batch).to(self.device, non_blocking=True)
+        done_batch = torch.FloatTensor(done_batch).to(self.device, non_blocking=True)
         
         # Apply data augmentation (random crop)
         state_batch = self.aug(state_batch)
@@ -312,8 +347,8 @@ class SACAgent:
     def save_checkpoint(self, filename, episode, best_reward, memory=None):
         checkpoint = {
             'episode': episode,
-            'actor_state_dict': self.actor.state_dict(),
-            'critic_state_dict': self.critic.state_dict(),
+            'actor_state_dict': self._safe_get_state(self.actor),
+            'critic_state_dict': self._safe_get_state(self.critic),
             'target_critic_state_dict': self.target_critic.state_dict(),
             'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
             'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
@@ -327,34 +362,77 @@ class SACAgent:
         }
         if torch.cuda.is_available():
             checkpoint['rng_state_cuda'] = torch.cuda.get_rng_state()
+        
+        # Save GradScaler states for proper resume
+        checkpoint['scaler_critic_state'] = self.scaler_critic.state_dict()
+        checkpoint['scaler_actor_state'] = self.scaler_actor.state_dict()
             
-        if memory is not None:
-            checkpoint['replay_buffer'] = memory.buffer
-            # print(f"   Saved replay buffer with {len(memory)} samples") # Optional: Uncomment for debug
+        # We don't save the buffer in the checkpoint dict anymore to keep it light
+        # The buffer is saved separately if needed, or we rely on the separate save logic
         torch.save(checkpoint, filename)
+        
+        if memory is not None:
+            # Save buffer to separate file (compressed)
+            buffer_path = filename.replace('.pth', '_buffer.npz')
+            # Check if this is the 'latest' checkpoint, we only really need to save buffer for latest
+            # to avoid filling disk space
+            if "latest" in filename or "best" not in filename: 
+                 memory.save(buffer_path)
 
     def load_checkpoint(self, filename, memory=None):
-        checkpoint = torch.load(filename)
-        self.actor.load_state_dict(checkpoint['actor_state_dict'])
-        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+        checkpoint = torch.load(filename, map_location=self.device, weights_only=False)
+        
+        self._safe_load_state(self.actor, checkpoint['actor_state_dict'])
+        self._safe_load_state(self.critic, checkpoint['critic_state_dict'])
         self.target_critic.load_state_dict(checkpoint['target_critic_state_dict'])
+        
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
         self.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer_state_dict'])
         self.log_alpha = checkpoint['log_alpha']
         self.total_steps = checkpoint['total_steps']
         
-        # Load RNG states
-        if 'rng_state_torch' in checkpoint:
-            torch.set_rng_state(checkpoint['rng_state_torch'])
-            np.random.set_state(checkpoint['rng_state_numpy'])
-            random.setstate(checkpoint['rng_state_random'])
-            if torch.cuda.is_available() and 'rng_state_cuda' in checkpoint:
-                torch.cuda.set_rng_state(checkpoint['rng_state_cuda'])
+        # Load RNG states (handle errors gracefully)
+        try:
+            if 'rng_state_torch' in checkpoint:
+                print("   🎲 Loading RNG states...")
+                torch.set_rng_state(checkpoint['rng_state_torch'].cpu().byte()) # Cast to ByteTensor
+                np.random.set_state(checkpoint['rng_state_numpy'])
+                random.setstate(checkpoint['rng_state_random'])
+                if torch.cuda.is_available() and 'rng_state_cuda' in checkpoint:
+                     # Cast CUDA rng state if possible, though usually it's ByteTensor already
+                    torch.cuda.set_rng_state(checkpoint['rng_state_cuda'].cpu().byte())
+        except Exception as e:
+            print(f"⚠️  Could not load RNG states: {e}")
         
-        if memory is not None and 'replay_buffer' in checkpoint:
-            memory.buffer = checkpoint['replay_buffer']
-            print(f"   Loaded replay buffer with {len(memory)} samples")
+        # Load GradScaler states
+        if 'scaler_critic_state' in checkpoint:
+            self.scaler_critic.load_state_dict(checkpoint['scaler_critic_state'])
+        if 'scaler_actor_state' in checkpoint:
+            self.scaler_actor.load_state_dict(checkpoint['scaler_actor_state'])
+        
+        # Handle Buffer Loading (Legacy vs New)
+        if memory is not None:
+            buffer_path = filename.replace('.pth', '_buffer.npz')
+            if os.path.exists(buffer_path):
+                print(f"   📥 Loading optimized numpy buffer from {buffer_path}...")
+                memory.load(buffer_path)
+            elif 'replay_buffer' in checkpoint:
+                print("   ⚠️  Found legacy list-based buffer in checkpoint. Migrating... (this may take a moment)")
+                legacy_buffer = checkpoint['replay_buffer']
+                # Migration logic: iterate and push
+                # We assume the legacy buffer data format matches what push expects (s, a, r, ns, d)
+                # Note: Legacy buffer stored (state, action, reward, next_state, done)
+                for item in legacy_buffer:
+                    if item is not None:
+                        # Unpack
+                        s, a, r, ns, d = item
+                        memory.push(s, a, r, ns, d)
+                print(f"   ✅ Migrated {len(legacy_buffer)} samples to new buffer.")
+            else:
+                print("   ⚠️  No replay buffer found.")
+            
+        return checkpoint['episode'], checkpoint['best_reward']
             
         return checkpoint['episode'], checkpoint['best_reward']
 
@@ -395,11 +473,15 @@ def main():
                         help=f'Batch size for training (default: {BATCH_SIZE})')
     parser.add_argument('--skip-buffer', action='store_true',
                         help='Skip loading replay buffer from checkpoint (use for low RAM)')
+    parser.add_argument('--update-freq', type=int, default=2,
+                        help='Gradient update frequency (default: 2)')
     args = parser.parse_args()
     
     # Use the command-line batch size (or default)
     batch_size = args.batch_size
-    print(f"📦 Using batch size: {batch_size}")
+    update_freq = args.update_freq
+    
+    print(f"📦 Batch size: {batch_size} | ⚡ Update Freq: {update_freq}")
     if args.skip_buffer:
         print(f"⚠️  Replay buffer loading disabled (--skip-buffer)")
 
@@ -411,8 +493,15 @@ def main():
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        
+        # New 40-series/Ampere optimization
+        try:
+            torch.set_float32_matmul_precision('medium')
+            print("✅ TensorFloat-32 (Medium) Enabled")
+        except AttributeError:
+            pass
+
         torch.cuda.empty_cache()
-        print(f"✅ CUDA optimizations enabled")
         print(f"   GPU: {torch.cuda.get_device_name(0)}")
         print(f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     else:
@@ -435,7 +524,10 @@ def main():
     action_dim = env.action_space.shape[0]
 
     agent = SACAgent(state_dim, action_dim, HIDDEN_SIZE, action_limit, device)
-    memory = ReplayMemory(MEMORY_SIZE)
+    
+    # Initialize Optimized Buffer
+    memory = ReplayBuffer(MEMORY_SIZE, state_dim, action_dim, device)
+    
     writer = SummaryWriter(LOG_DIR)
     
     # Auto-resume capability
@@ -467,22 +559,30 @@ def main():
     # This handles the case where latest.pth was deleted but best_model.pth still holds the best score.
     if os.path.exists(BEST_MODEL_CHECKPOINT):
         try:
-            best_model_checkpoint_data = torch.load(BEST_MODEL_CHECKPOINT, map_location=device)
+            print("🔍 Checking best_model.pth for record...")
+            best_model_checkpoint_data = torch.load(BEST_MODEL_CHECKPOINT, map_location=device, weights_only=False)
             best_reward_in_file = best_model_checkpoint_data.get('best_reward', -float('inf'))
             if best_reward_in_file > best_eval_reward:
-                print(f"🏆 Found existing best_model.pth with reward {best_reward_in_file:.1f}. Will not overwrite unless beaten.")
+                print(f"   🏆 Found existing best record: {best_reward_in_file:.1f} (will only overwrite if beaten)")
                 best_eval_reward = best_reward_in_file
+            else:
+                 print(f"   👍 Current session best ({best_eval_reward:.1f}) is already better or equal.")
         except Exception as e:
             print(f"⚠️  Could not read best_model.pth for reward comparison: {e}")
 
+    # Global environment step counter
+    env_steps = 0
+
     try:
         for episode in range(start_episode, NUM_EPISODES):
+            start_time = time.time()
             state, _ = env.reset(seed=SEED + episode)
             state, stacked_frames = stack_frames(None, state, True)
             episode_reward = 0
             
             for step in range(MAX_STEPS_PER_EPISODE):
-                if agent.total_steps < INITIAL_EXPLORATION_STEPS and not os.path.exists(LATEST_CHECKPOINT):
+                env_steps += 1
+                if env_steps < INITIAL_EXPLORATION_STEPS and start_episode == 0:
                     action = env.action_space.sample()
                 else:
                     action = agent.select_action(state)
@@ -505,9 +605,10 @@ def main():
                 state = next_state
                 episode_reward += total_reward
 
-                # Updated frequency: Every 2 steps + double gradient updates
-                if len(memory) > batch_size and agent.total_steps % 2 == 0:
-                    for _ in range(2):  # Double gradient updates for faster learning
+                # Updated frequency: Every 2 environment steps + double gradient updates
+                # Updated frequency: Every N environment steps
+                if len(memory) > batch_size and step % update_freq == 0:
+                    for _ in range(update_freq):  # Balanced updates
                         update_info, _ = agent.update_parameters(memory, batch_size)
                         if update_info:
                             writer.add_scalar('Loss/critic', update_info['critic_loss'], agent.total_steps)
@@ -518,13 +619,36 @@ def main():
                     break
 
             writer.add_scalar('Reward/train', episode_reward, episode)
-            print(f"Episode {episode}/{NUM_EPISODES}, Reward: {episode_reward:.1f}, Steps: {step}")
             
-            # Optional Memory Monitoring
-            if episode % 10 == 0 and torch.cuda.is_available():
+            # Calculate FPS and Stats
+            duration = time.time() - start_time
+            fps = step / duration if duration > 0 else 0
+            
+            # Enhanced Debug Output
+            is_training = len(memory) > batch_size
+            debug_info = [
+                f"Episode {episode}/{NUM_EPISODES}",
+                f"Reward: {episode_reward:.1f}",
+                f"Steps: {step}",
+                f"Buffer: {len(memory)}/{MEMORY_SIZE}",
+            ]
+            
+            if is_training:
+                debug_info.append(f"Alpha: {agent.alpha.item():.3f}")
+                if update_info:
+                    debug_info.append(f"ActL: {update_info['actor_loss']:.1f}")
+                    debug_info.append(f"CriL: {update_info['critic_loss']:.1f}")
+            
+            debug_info.append(f"⏱️  {duration:.1f}s")
+            debug_info.append(f"⚡ {fps:.1f} FPS")
+            
+            print(" | ".join(debug_info))
+            
+            # VRAM monitoring every episode
+            if torch.cuda.is_available():
                 allocated = torch.cuda.memory_allocated() / 1e9
                 reserved = torch.cuda.memory_reserved() / 1e9
-                print(f"   VRAM: {allocated:.2f}GB / {reserved:.2f}GB")
+                print(f"   📊 VRAM: {allocated:.2f}GB / {reserved:.2f}GB | RAM Buffer: ~{len(memory) * 28 / 1e6:.1f}MB")
 
             # Save latest checkpoint after each episode
             agent.save_checkpoint(LATEST_CHECKPOINT, episode, best_eval_reward, memory)

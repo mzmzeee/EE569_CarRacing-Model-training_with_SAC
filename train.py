@@ -188,7 +188,7 @@ class CriticNetwork(nn.Module):
 
 
 class SACAgent:
-    def __init__(self, state_dim, action_dim, hidden_dim, action_limit, device):
+    def __init__(self, state_dim, action_dim, hidden_dim, action_limit, device, no_compile=False):
         self.device = device
         self.action_limit = action_limit
         self.alpha_init = ALPHA_INIT
@@ -199,7 +199,7 @@ class SACAgent:
         self.target_critic.load_state_dict(self.critic.state_dict())
 
         # OPTIMIZATION: Compile models if available (PyTorch 2.0+)
-        if hasattr(torch, 'compile'):
+        if hasattr(torch, 'compile') and not no_compile:
             print("🚀 Compiling models with torch.compile()...")
             self.actor = torch.compile(self.actor)
             self.critic = torch.compile(self.critic)
@@ -209,7 +209,8 @@ class SACAgent:
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=LEARNING_RATE)
 
         self.target_entropy = -float(action_dim)  # SAC standard: -dim(A)
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        # Initialize alpha to ALPHA_INIT (0.2) instead of 1.0 (log(1)=0)
+        self.log_alpha = torch.tensor([np.log(self.alpha_init)], requires_grad=True, device=device, dtype=torch.float32)
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=LEARNING_RATE)
         
         # Mixed precision scalers
@@ -225,7 +226,7 @@ class SACAgent:
 
     @property
     def alpha(self):
-        return self.log_alpha.exp()
+        return self.log_alpha.exp().float()
 
     def _safe_load_state(self, model, state_dict):
         """Safely load state dict, handling compiled models and prefix issues."""
@@ -284,9 +285,9 @@ class SACAgent:
         state_batch = torch.as_tensor(state_batch, device=self.device).float().div_(255.0)
         next_state_batch = torch.as_tensor(next_state_batch, device=self.device).float().div_(255.0)
         
-        action_batch = torch.as_tensor(action_batch, device=self.device)
-        reward_batch = torch.as_tensor(reward_batch, device=self.device)
-        done_batch = torch.as_tensor(done_batch, device=self.device)
+        action_batch = torch.as_tensor(action_batch, device=self.device).float()
+        reward_batch = torch.as_tensor(reward_batch, device=self.device).float()
+        done_batch = torch.as_tensor(done_batch, device=self.device).float()
         
         # Apply data augmentation (random crop)
         # Optimization: Batch the augmentation to reduce kernel launches
@@ -344,7 +345,10 @@ class SACAgent:
         return {
             'actor_loss': actor_loss,
             'critic_loss': critic_loss,
-            'alpha': self.alpha
+            'alpha': self.alpha,
+            'alpha_loss': alpha_loss,
+            'current_entropy': -log_pi.mean(),
+            'target_entropy': self.target_entropy
         }, None
 
     def save_checkpoint(self, filename, episode, best_reward, memory=None):
@@ -391,8 +395,26 @@ class SACAgent:
         
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
-        self.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer_state_dict'])
-        self.log_alpha = checkpoint['log_alpha']
+        
+        # Load alpha
+        loaded_log_alpha = checkpoint['log_alpha']
+        
+        # Check for stuck alpha (> 0.9) from previous runs and reset if needed
+        current_alpha = loaded_log_alpha.exp().item() if isinstance(loaded_log_alpha, torch.Tensor) else np.exp(loaded_log_alpha)
+        reset_alpha = False
+        if current_alpha > 0.9:
+            print(f"   🔧 Detected stuck Alpha ({current_alpha:.3f} > 0.9). Resetting to ALPHA_INIT ({self.alpha_init}).")
+            self.log_alpha = torch.tensor([np.log(self.alpha_init)], requires_grad=True, device=self.device, dtype=torch.float32)
+            reset_alpha = True
+        else:
+            self.log_alpha = loaded_log_alpha
+
+        # ALWAYS re-initialize optimizer to track the current self.log_alpha tensor
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=LEARNING_RATE)
+        
+        if not reset_alpha:
+            self.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer_state_dict'])
+
         self.total_steps = checkpoint['total_steps']
         
         # Load RNG states (handle errors gracefully)
@@ -478,6 +500,8 @@ def main():
                         help='Skip loading replay buffer from checkpoint (use for low RAM)')
     parser.add_argument('--update-freq', type=int, default=8,
                         help='Gradient update frequency (default: 8)')
+    parser.add_argument('--no-compile', action='store_true',
+                        help='Disable torch.compile (for debugging FPS issues)')
     args = parser.parse_args()
     
     # Use the command-line batch size (or default)
@@ -527,7 +551,7 @@ def main():
     state_dim = (4, 84, 84)
     action_dim = env.action_space.shape[0]
 
-    agent = SACAgent(state_dim, action_dim, HIDDEN_SIZE, action_limit, device)
+    agent = SACAgent(state_dim, action_dim, HIDDEN_SIZE, action_limit, device, no_compile=args.no_compile)
     
     # Initialize Optimized Buffer
     memory = ReplayBuffer(MEMORY_SIZE, state_dim, action_dim, device)
@@ -616,12 +640,13 @@ def main():
                     for _ in range(max(1, update_freq // 2)): 
                         update_info, _ = agent.update_parameters(memory, batch_size)
                     
-                    # Log only once per batch of updates to reduce CPU-GPU sync overhead
-                    # Optimization: Moved logging OUTSIDE the loop
-                    if update_info:
+                    # Log less frequently to avoid CPU-GPU sync stall (every 50 updates)
+                    if update_info and step % 50 == 0:
                         writer.add_scalar('Loss/critic', update_info['critic_loss'].item(), agent.total_steps)
                         writer.add_scalar('Loss/actor', update_info['actor_loss'].item(), agent.total_steps)
+                        writer.add_scalar('Loss/alpha', update_info['alpha_loss'].item(), agent.total_steps)
                         writer.add_scalar('Alpha', update_info['alpha'].item(), agent.total_steps)
+                        writer.add_scalar('Entropy/current', update_info['current_entropy'].item(), agent.total_steps)
 
                 if done:
                     break
@@ -642,10 +667,11 @@ def main():
             ]
             
             if is_training:
-                debug_info.append(f"Alpha: {agent.alpha.item():.3f}")
+                debug_info.append(f"Alpha: {agent.alpha.item():.5f}") # High precision to see micro-movements
                 if update_info:
                     debug_info.append(f"ActL: {update_info['actor_loss'].item():.1f}")
                     debug_info.append(f"CriL: {update_info['critic_loss'].item():.1f}")
+                    debug_info.append(f"Ent: {update_info['current_entropy'].item():.2f}")
             
             debug_info.append(f"⏱️  {duration:.1f}s")
             debug_info.append(f"⚡ {fps:.1f} FPS")
@@ -707,8 +733,15 @@ def main():
     except KeyboardInterrupt:
         print("\n⏸️  Training interrupted!")
         print("Saving checkpoint...")
-        agent.save_checkpoint(LATEST_CHECKPOINT, episode, best_eval_reward, memory)
-        print(f"✅ Saved: {LATEST_CHECKPOINT}")
+        
+        # Save episode - 1 so we retry the current interrupted episode on resume
+        # If we save 'episode', the loader does 'start = episode + 1', skipping this one.
+        # Handle case where episode variable might not be defined if interrupt happened very early
+        current_ep = episode if 'episode' in locals() else start_episode
+        save_ep = max(start_episode, current_ep - 1)
+        
+        agent.save_checkpoint(LATEST_CHECKPOINT, save_ep, best_eval_reward, memory)
+        print(f"✅ Saved: {LATEST_CHECKPOINT} (Episode {save_ep})")
         sys.exit(0)
     finally:
         env.close()

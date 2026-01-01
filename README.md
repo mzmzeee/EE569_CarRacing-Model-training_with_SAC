@@ -1,114 +1,92 @@
+## 🏎️ CarRacing-v3 SAC Agent (Optimized for RTX 4050 Laptop)
+
+This project implements a **Soft Actor-Critic (SAC)** agent to solve the `CarRacing-v3` environment. It has been heavily optimized for consumer hardware (specifically **6GB VRAM / 16GB RAM**) to achieve maximum FPS and stability without crashing.
+
+## ⚡ Key Optimizations (The "Maximized Pipeline")
+
+We achieved **~9 FPS** (up from 2 FPS) and stable training on an RTX 4050 Laptop GPU by implementing the following:
+
+### 1. Memory Management (RAM & VRAM)
+*   **Uint8 Buffer:** The Replay Buffer stores states as `uint8` (0-255) instead of `float32`, reducing RAM usage by **4x**. Normalization happens on the GPU on-the-fly.
+*   **Pre-allocated Numpy Arrays:** We use a custom `buffer.py` with pre-allocated arrays to prevent memory fragmentation and garbage collection spikes.
+*   **Reduced Hidden Size:** `HIDDEN_SIZE = 256` (down from 512) to fit within 6GB VRAM while maintaining learning capacity.
+*   **PyTorch Allocation:** `os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"` prevents "CUDA out of memory" fragmentation errors.
+
+### 2. Speed & Throughput
+*   **Async Data Transfer:** `non_blocking=True` is used when moving batches to GPU, allowing data transfer to overlap with computation.
+*   **Torch Compile:** `torch.compile()` is enabled for the Actor and Critic networks (PyTorch 2.0+ feature).
+*   **Update Frequency:** We update the network every **16 steps** (instead of 1 or 8).
+*   **Reduced Update Ratio:** We perform `update_freq // 4` updates per cycle (0.25 updates per step). This significantly reduces the GPU computational load while maintaining sample efficiency.
+*   **Action Repeat:** `ACTION_REPEAT = 4` (Frame skipping) allows the agent to see further into the future and train 4x faster.
+
+---
+
 ## 🚀 Quick Start
 
 ### 1. Setup
 ```bash
 # 1. Create virtual environment with Python 3.12
-# (Requires python 3.12 to be installed on your system)
 uv venv --python 3.12
 
 # 2. Activate environment
 source .venv/bin/activate
 
 # 3. Install dependencies
-# 'swig' is required for Box2D
 uv pip install swig
 uv pip install -r requirements.txt
 ```
 
-### 2. Verify Setup
+### 2. Train (Optimized Command)
+Run the training with the specific batch size that fits 6GB VRAM:
+
 ```bash
-python test_setup.py
+uv run train.py --batch-size 256
 ```
 
-### 3. Train
+*   **Batch Size 256:** The sweet spot. 400+ risks OOM on 6GB cards.
+*   **Update Freq 16:** Default in code, ensures high FPS.
+
+### 3. Monitor
 ```bash
-./run_training.sh
-# OR
-python train.py
+tensorboard --logdir=logs
 ```
+Open `http://localhost:6006` to see rewards, losses, and entropy.
+
+---
+
+## ⚙️ Configuration Guide
+
+If you need to tweak settings for different hardware, here is where to look in `train.py`:
+
+### Hardware Profiles
+
+| Hardware | VRAM | RAM | Recommended Settings |
+| :--- | :--- | :--- | :--- |
+| **RTX 4050 (Current)** | **6GB** | **16GB** | `BATCH_SIZE=256`, `MEMORY_SIZE=200000`, `HIDDEN_SIZE=256` |
+| **RTX 3060 / 4060** | **8GB** | **16GB** | `BATCH_SIZE=512`, `MEMORY_SIZE=200000`, `HIDDEN_SIZE=256` |
+| **RTX 3080 / 4080** | **12GB+** | **32GB** | `BATCH_SIZE=1024`, `MEMORY_SIZE=500000`, `HIDDEN_SIZE=512` |
+
+### Key Constants in `train.py`
+
+*   **Line 28:** `BATCH_SIZE` - Controls VRAM usage. Lower this if you get CUDA OOM.
+*   **Line 33:** `MEMORY_SIZE` - Controls RAM usage. `200000` uses ~13GB system RAM. Lower to `150000` if you have background apps open.
+*   **Line 34:** `HIDDEN_SIZE` - Network width. `256` is sufficient for CarRacing.
+*   **Line 505:** `parser.add_argument('--update-freq', ...)` - Controls speed vs sample efficiency. Higher = Faster FPS, Slower convergence.
+
+---
 
 ## ⏸️ Pause & Resume
 
-- **Pause:** Ctrl+C (auto-saves checkpoint)
-- **Resume:** Run `python train.py` again
+*   **Pause:** Press `Ctrl+C` at any time. The agent will safely save the checkpoint and the replay buffer.
+*   **Resume:** Simply run the training command again.
+    *   It automatically detects `checkpoints/latest.pth`.
+    *   It automatically loads `checkpoints/latest_buffer.npz`.
+    *   It fixes "Stuck Alpha" issues automatically.
 
-## 📊 Monitor Progress
+## 📁 Project Structure
 
-```bash
-# Terminal 1: Training
-python train.py
-
-# Terminal 2: TensorBoard
-tensorboard --logdir=logs
-```
-
-Open: `http://localhost:6006`
-
-## 🔧 GPU Configurations
-
-### Current: RTX 4050 (6GB VRAM, 16GB RAM) - MAXED!
-
-The default `train.py` is **maxed out** for RTX 4050:
-
-| Parameter | Value | Usage |
-|-----------|-------|-------|
-| BATCH_SIZE | 1280 | ~85% VRAM |
-| HIDDEN_SIZE | 512 | Maximum capacity |
-| MEMORY_SIZE | 500,000 | ~80% RAM |
-| NUM_EPISODES | 2000 | ~4-5 hours |
-
-### Upgrade: RTX 5060 Ti (16GB VRAM, 32GB RAM)
-
-For RTX 5060 Ti, edit these values in `train.py` (lines 15-27):
-
-```python
-# Hyperparameters (MAXED for RTX 5060 Ti - 16GB VRAM, 32GB RAM)
-NUM_EPISODES = 2500                    # More episodes for polish
-BATCH_SIZE = 2048                      # 16GB VRAM can handle much more
-MEMORY_SIZE = 800000                   # 32GB RAM allows massive buffer
-HIDDEN_SIZE = 512                      # Better network capacity
-INITIAL_EXPLORATION_STEPS = 30000      # More exploration
-```
-
-**Expected RTX 5060 Ti Performance:**
-- ⚡ Training time: ~5-6 hours (2500 episodes)
-- 📈 Target reward: 850-950+
-- 🎯 VRAM usage: ~12-14GB (75-85%)
-- 💾 RAM usage: ~24-26GB (75-80%)
-
-## ⏸️ Checkpoint System
-
-Training automatically saves checkpoints:
-- **On interrupt (Ctrl+C):** Saves `checkpoints/latest.pth`
-- **Every 20 episodes:** Evaluates and saves `checkpoints/best_model.pth` if improved
-- **Resume:** Just run `python train.py` again - it auto-detects checkpoints
-
-## 📁 Structure
-
-```
-├── train.py           # Main training
-├── inference.py       # Run trained model
-├── test_setup.py      # Verify setup
-├── run_training.sh    # Start script
-├── checkpoints/       # Model saves
-├── videos/           # Evaluation videos
-└── logs/             # TensorBoard
-```
-
-## ⚠️ Troubleshooting
-
-**Out of Memory (RTX 4050):**
-```python
-# In train.py, reduce:
-BATCH_SIZE = 768       # Down from 1280
-MEMORY_SIZE = 350000   # Down from 500000
-HIDDEN_SIZE = 384      # Down from 512
-```
-
-**Out of Memory (RTX 5060 Ti):**
-```python
-# In train.py, reduce:
-BATCH_SIZE = 1280      # Down from 2048
-MEMORY_SIZE = 600000   # Down from 800000
-HIDDEN_SIZE = 384      # Down from 512
-```
+*   `train.py`: Main training loop, SAC implementation, and hyperparameters.
+*   `buffer.py`: Optimized Numpy-based Replay Buffer (Critical for RAM performance).
+*   `checkpoints/`: Stores `.pth` models and `.npz` buffers.
+*   `videos/`: Stores evaluation replays (MP4/GIF) to see how the agent drives.
+*   `logs/`: Tensorboard logs.

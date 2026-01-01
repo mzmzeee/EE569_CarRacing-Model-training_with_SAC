@@ -31,7 +31,7 @@ GAMMA = 0.99
 TAU = 0.01                             # Soft target updates
 ALPHA_INIT = 0.2
 LEARNING_RATE = 3e-4                   # Standard SAC learning rate
-MEMORY_SIZE = 200000                   # 300k steps ~ 8.5GB RAM (Optimized)
+MEMORY_SIZE = 180000                   # 300k steps ~ 8.5GB RAM (Optimized)
 HIDDEN_SIZE = 256                      # Reduced to 256 to save VRAM and compute
 INITIAL_EXPLORATION_STEPS = 20000      # Exploration before policy training
 EXPLORATION_NOISE = 0.15               # Action noise for exploration
@@ -690,11 +690,11 @@ def main():
             agent.save_checkpoint(LATEST_CHECKPOINT, episode, best_eval_reward, memory=None)
             
             # Save buffer periodically (every 10 episodes)
-            if episode % 10 == 0:
+            if episode % 50 == 0:
                 memory.save(os.path.join(CHECKPOINT_DIR, "latest_buffer.npz"))
 
             # Evaluation and Best Checkpoint Saving (every 10 episodes)
-            if episode % 10 == 0:
+            if episode % 50 == 0:
                 avg_reward = 0
                 eval_episodes = 3 # Small eval to save time
                 
